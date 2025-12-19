@@ -4,12 +4,13 @@ Orchestrates imagery fetching, Gemini 3 Flash detection, and geo-referenced outp
 
 Pipeline:
 1. Input: Municipality name or bounding box
-2. Fetch aerial imagery from PDOK (8cm resolution)
+2. Fetch aerial imagery from PDOK (8cm resolution) OR Google Maps Static API
 3. Send to Gemini 3 Flash for two-step parking detection (All spots -> Empty spots)
 4. Merge results to determine occupancy
 5. Convert to GeoJSON with WGS84 coordinates
 
 Requires: GEMINI_API_KEY or GOOGLE_API_KEY environment variable
+For Google Maps: GOOGLE_MAPS_API_KEY
 """
 import asyncio
 import logging
@@ -18,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 import numpy as np
+import os
 
 from src.imagery_fetcher import (
     PDOKImageryFetcher,
@@ -25,6 +27,8 @@ from src.imagery_fetcher import (
     MunicipalityGeocoder,
     CoordinateTransformer
 )
+from src.google_maps_fetcher import GoogleMapsImageryFetcher
+
 from src.parking_detector import (
     ParkingDetectionPipeline,
     DetectionResult,
@@ -54,6 +58,9 @@ class ProcessingConfig:
     api_key: Optional[str] = None  # Google API key (or set GOOGLE_API_KEY env var)
     model_name: str = "gemini-3-flash-preview"  # Gemini model to use
     
+    # Google Maps settings
+    google_maps_api_key: Optional[str] = None # set via GOOGLE_MAPS_API_KEY env var
+
     # Legacy settings (kept for compatibility, ignored by Gemini pipeline)
     parking_model_path: Optional[str] = None
     parking_confidence: float = 0.7
@@ -101,11 +108,13 @@ class ParkingDetectionOrchestrator:
         
         # Initialize components
         self.imagery_fetcher = PDOKImageryFetcher(use_high_res=True)
+        self.google_fetcher = None
+
         self.geocoder = MunicipalityGeocoder()
         self.coord_transformer = CoordinateTransformer()
         self.geo_converter = DetectionToGeoConverter(resolution=self.config.resolution)
         self.geojson_exporter = GeoJSONExporter()
-        self.deduplicator = SpatialDeduplicator(threshold_meters=self.config.dedup_distance_meters)
+        self.deduplicator = SpatialDeduplicator(distance_threshold_meters=self.config.dedup_distance_meters)
         
         # Detection pipeline (lazy loaded)
         self._detection_pipeline = None
@@ -122,6 +131,12 @@ class ParkingDetectionOrchestrator:
             )
         return self._detection_pipeline
     
+    def _get_google_fetcher(self) -> GoogleMapsImageryFetcher:
+        """Get or create Google Maps fetcher"""
+        if self.google_fetcher is None:
+            self.google_fetcher = GoogleMapsImageryFetcher(api_key=self.config.google_maps_api_key)
+        return self.google_fetcher
+
     async def process_municipality(
         self,
         municipality_name: str,
@@ -130,7 +145,7 @@ class ParkingDetectionOrchestrator:
         progress_callback: Optional[callable] = None
     ) -> ProcessingResult:
         """
-        Process entire municipality and detect all parking spaces
+        Process entire municipality and detect all parking spaces using PDOK imagery
         
         Args:
             municipality_name: Name of Dutch municipality
@@ -190,6 +205,87 @@ class ParkingDetectionOrchestrator:
                 tiles_processed=0
             )
         
+        # Process detection on these tiles (Shared logic)
+        return await self._process_tiles(
+            tiles=tiles,
+            municipality_name=municipality_name,
+            output_dir=output_dir,
+            area_km2=area_km2,
+            start_time=start_time,
+            progress_callback=progress_callback
+        )
+
+    async def process_google_maps_area(
+        self,
+        lat: float,
+        lon: float,
+        radius: float = 200.0,
+        name: str = "google_maps_area",
+        output_dir: Optional[str] = None,
+        progress_callback: Optional[callable] = None
+    ) -> ProcessingResult:
+        """
+        Process an area using Google Maps imagery
+        """
+        start_time = datetime.now()
+        output_dir = Path(output_dir) if output_dir else Path("output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Calculate approximate area
+        area_km2 = (3.14159 * radius * radius) / 1_000_000
+        logger.info(f"Processing Google Maps area: {name} ({lat}, {lon}) r={radius}m")
+
+        if progress_callback:
+            progress_callback(10.0, "Fetching Google Maps imagery...")
+
+        fetcher = self._get_google_fetcher()
+        tiles = await fetcher.fetch_tiles_for_area(
+            center_lat=lat,
+            center_lon=lon,
+            radius_meters=radius,
+            zoom=21
+        )
+
+        logger.info(f"Fetched {len(tiles)} tiles from Google Maps")
+
+        if not tiles:
+            logger.error("No tiles fetched from Google Maps")
+            return ProcessingResult(
+                municipality=name,
+                total_area_km2=area_km2,
+                total_parking_spaces=0,
+                empty_spaces=0,
+                occupied_spaces=0,
+                occupancy_rate=0.0,
+                parking_spaces=[],
+                statistics={},
+                processing_time_seconds=0,
+                tiles_processed=0
+            )
+
+        return await self._process_tiles(
+            tiles=tiles,
+            municipality_name=name,
+            output_dir=output_dir,
+            area_km2=area_km2,
+            start_time=start_time,
+            progress_callback=progress_callback,
+            source_type="google_maps"
+        )
+
+    async def _process_tiles(
+        self,
+        tiles: List[Any], # List[Tile]
+        municipality_name: str,
+        output_dir: Path,
+        area_km2: float,
+        start_time: datetime,
+        progress_callback: Optional[callable] = None,
+        source_type: str = "pdok"
+    ) -> ProcessingResult:
+        """
+        Common processing logic for tiles (detection, deduplication, export)
+        """
         # Step 3: Run detection on all tiles
         if progress_callback:
             progress_callback(20.0, "Running parking detection...")
@@ -212,13 +308,17 @@ class ParkingDetectionOrchestrator:
             result = pipeline.detect(tile.image)
             
             # Convert to geo-referenced parking spaces
-            if result.parking_spots and tile.bounds_rd:
-                bounds_tuple = tile.bounds_rd.to_tuple()
-                image_size = (self.config.tile_size_pixels, self.config.tile_size_pixels)
+            # Check if tile has RD bounds or WGS84 bounds
+
+            if result.parking_spots:
+                image_size = tile.image.shape[:2][::-1] # (width, height)
                 
                 for spot in result.parking_spots:
                     geo_space = self._convert_spot_to_geo(
-                        spot, bounds_tuple, image_size, 
+                        spot=spot,
+                        bounds_rd=tile.bounds_rd.to_tuple() if tile.bounds_rd else None,
+                        bounds_wgs84=tile.bounds_wgs84.to_tuple() if tile.bounds_wgs84 else None,
+                        image_size=image_size,
                         source_tile=f"tile_{idx:04d}"
                     )
                     if geo_space:
@@ -266,6 +366,7 @@ class ParkingDetectionOrchestrator:
             "area_km2": area_km2,
             "tiles_processed": len(tiles),
             "pipeline": "Gemini 3 Flash (Two-step detection)",
+            "source": source_type,
             "config": {
                 "model": self.config.model_name,
                 "overlap_threshold": self.config.overlap_threshold
@@ -303,9 +404,10 @@ class ParkingDetectionOrchestrator:
     def _convert_spot_to_geo(
         self,
         spot: ParkingSpot,
-        bounds_rd: Tuple[float, float, float, float],
+        bounds_rd: Optional[Tuple[float, float, float, float]],
         image_size: Tuple[int, int],
-        source_tile: str
+        source_tile: str,
+        bounds_wgs84: Optional[Tuple[float, float, float, float]] = None
     ) -> Optional[ParkingSpaceGeo]:
         """Convert a ParkingSpot to geo-referenced ParkingSpaceGeo"""
         try:
@@ -313,7 +415,8 @@ class ParkingDetectionOrchestrator:
             corners_wgs84 = self.geo_converter.converter.corners_to_wgs84(
                 corners_pixels=spot.polygon,
                 image_bounds_rd=bounds_rd,
-                image_size=image_size
+                image_size=image_size,
+                image_bounds_wgs84=bounds_wgs84
             )
             
             if not corners_wgs84:
@@ -348,12 +451,7 @@ class ParkingDetectionOrchestrator:
         output_dir: Optional[str] = None
     ) -> ProcessingResult:
         """
-        Process a custom bounding box area
-        
-        Args:
-            bbox: Bounding box in Dutch RD coordinates
-            area_name: Name for the area
-            output_dir: Output directory
+        Process a custom bounding box area (RD coordinates)
         """
         return await self.process_municipality(
             municipality_name=area_name,
@@ -364,6 +462,8 @@ class ParkingDetectionOrchestrator:
     async def close(self):
         """Clean up resources"""
         await self.imagery_fetcher.close()
+        if self.google_fetcher:
+            await self.google_fetcher.close()
         await self.geocoder.close()
 
 
@@ -423,13 +523,7 @@ async def detect_parking_spaces(
     parking_model_path: Optional[str] = None
 ) -> ProcessingResult:
     """
-    Main entry point for parking space detection
-    
-    Args:
-        municipality: Municipality name (e.g., "Amersfoort", "Amsterdam")
-        output_dir: Output directory for GeoJSON files
-        test_mode: If True, process only a 1km² test area
-        parking_model_path: Path to trained parking detection model
+    Main entry point for parking space detection (Legacy wrapper for PDOK)
     """
     config = ProcessingConfig(
         parking_model_path=parking_model_path,
@@ -474,35 +568,19 @@ async def detect_parking_spaces(
         await orchestrator.close()
 
 
-
-def run_detection(
-    municipality: str,
-    output_dir: str = "output",
-    test_mode: bool = False,
-    parking_model_path: Optional[str] = None
-) -> ProcessingResult:
-    """Synchronous wrapper for detection"""
-    return asyncio.run(detect_parking_spaces(
-        municipality, output_dir, test_mode, parking_model_path
-    ))
-
-
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Detect parking spaces in Dutch municipalities",
+        description="Detect parking spaces in Dutch municipalities or via Google Maps",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process a municipality (test mode - 1km² area)
+  # Process a municipality (PDOK)
   python -m src.main_pipeline Amersfoort --test --output output/
   
-  # Process with custom trained model
-  python -m src.main_pipeline Amersfoort --parking-model models/parking_yolov8s.pt
-  
-  # Process with custom bounding box
-  python -m src.main_pipeline --bbox 155000 463000 156000 464000 --output output/
+  # Process Google Maps area (lat/lon)
+  python -m src.main_pipeline --source google --lat 52.3702 --lon 4.8952 --radius 100
         """
     )
     
@@ -510,13 +588,39 @@ Examples:
         "municipality",
         nargs="?",
         default="Amersfoort",
-        help="Municipality name (default: Amersfoort)"
+        help="Municipality name (default: Amersfoort, ignored if --source google)"
+    )
+
+    parser.add_argument(
+        "--source",
+        choices=["pdok", "google"],
+        default="pdok",
+        help="Imagery source (default: pdok)"
+    )
+
+    parser.add_argument(
+        "--lat",
+        type=float,
+        help="Latitude (for Google Maps source)"
+    )
+
+    parser.add_argument(
+        "--lon",
+        type=float,
+        help="Longitude (for Google Maps source)"
+    )
+
+    parser.add_argument(
+        "--radius",
+        type=float,
+        default=200.0,
+        help="Radius in meters (for Google Maps source)"
     )
     
     parser.add_argument(
         "--test", "-t",
         action="store_true",
-        help="Test mode: process only 1km² area"
+        help="Test mode: process only 1km² area (PDOK only)"
     )
     
     parser.add_argument(
@@ -535,7 +639,7 @@ Examples:
         nargs=4,
         type=float,
         metavar=('WEST', 'SOUTH', 'EAST', 'NORTH'),
-        help="Custom bounding box in RD coordinates"
+        help="Custom bounding box in RD coordinates (PDOK only)"
     )
     
     args = parser.parse_args()
@@ -547,48 +651,84 @@ Examples:
     )
     
     print("="*60)
-    print("🅿️ DUTCH PARKING SPACE DETECTION SYSTEM")
+    print("🅿️ PARKING SPACE DETECTION SYSTEM")
     print("="*60)
     print(f"\nPipeline: Gemini 3 Flash (Two-step detection)")
     
-    if args.bbox:
-        print(f"\nProcessing custom bounding box...")
-        config = ProcessingConfig(parking_model_path=args.parking_model)
-        orchestrator = ParkingDetectionOrchestrator(config)
+    config = ProcessingConfig(parking_model_path=args.parking_model)
+    orchestrator = ParkingDetectionOrchestrator(config)
+
+    try:
+        if args.source == "google":
+            if args.lat is None or args.lon is None:
+                print("Error: --lat and --lon are required for source 'google'")
+                exit(1)
+
+            print(f"\nProcessing Google Maps area: {args.lat}, {args.lon}")
+            result = asyncio.run(orchestrator.process_google_maps_area(
+                lat=args.lat,
+                lon=args.lon,
+                radius=args.radius,
+                output_dir=args.output,
+                name=f"google_{args.lat}_{args.lon}"
+            ))
+
+        elif args.bbox:
+            print(f"\nProcessing custom bounding box (RD)...")
+            bbox = BoundingBox(
+                west=args.bbox[0],
+                south=args.bbox[1],
+                east=args.bbox[2],
+                north=args.bbox[3]
+            )
+
+            result = asyncio.run(orchestrator.process_custom_area(
+                bbox=bbox,
+                area_name="custom_area",
+                output_dir=args.output
+            ))
+        else:
+            print(f"\nProcessing municipality (PDOK): {args.municipality}")
+            print(f"Test mode: {args.test}")
+
+            result = asyncio.run(orchestrator.process_municipality(
+                args.municipality,
+                output_dir=args.output,
+                subset_bbox=None # Handle inside process_municipality for test mode if we were calling the cli func, but here we call orchestrator directly.
+            ))
+            # Note: The CLI args.test logic was inside the `detect_parking_spaces` helper.
+            # If using orchestrator directly, we need to replicate that logic if we want it.
+            # For now, sticking to the PDOK standard path for municipality arg.
+            if args.test:
+                 # Re-implement test mode logic here since we bypassed helper
+                geocoder = MunicipalityGeocoder()
+                full_bbox = asyncio.run(geocoder.get_municipality_bbox(args.municipality))
+                asyncio.run(geocoder.close())
+                cx, cy = full_bbox.center
+                test_bbox = BoundingBox(
+                    west=cx - 500, south=cy - 500, east=cx + 500, north=cy + 500, crs="EPSG:28992"
+                )
+                result = asyncio.run(orchestrator.process_municipality(
+                     args.municipality, output_dir=args.output, subset_bbox=test_bbox
+                ))
+            else:
+                 result = asyncio.run(orchestrator.process_municipality(
+                     args.municipality, output_dir=args.output
+                ))
+
+        # Print results
+        print("\n" + "="*60)
+        print("📊 RESULTS")
+        print("="*60)
+        print(f"Name: {result.municipality}")
+        print(f"Area: {result.total_area_km2:.6f} km²")
+        print(f"Tiles processed: {result.tiles_processed}")
+        print(f"Total parking spaces: {result.total_parking_spaces}")
+        print(f"Empty spaces: {result.empty_spaces}")
+        print(f"Occupied spaces: {result.occupied_spaces}")
+        print(f"Occupancy rate: {result.occupancy_rate:.1%}")
+        print(f"Processing time: {result.processing_time_seconds:.1f} seconds")
+        print(f"GeoJSON: {result.geojson_path}")
         
-        bbox = BoundingBox(
-            west=args.bbox[0],
-            south=args.bbox[1],
-            east=args.bbox[2],
-            north=args.bbox[3]
-        )
-        
-        result = asyncio.run(orchestrator.process_custom_area(
-            bbox=bbox,
-            area_name="custom_area",
-            output_dir=args.output
-        ))
-    else:
-        print(f"\nProcessing municipality: {args.municipality}")
-        print(f"Test mode: {args.test}")
-        
-        result = run_detection(
-            municipality=args.municipality,
-            output_dir=args.output,
-            test_mode=args.test,
-            parking_model_path=args.parking_model
-        )
-    
-    # Print results
-    print("\n" + "="*60)
-    print("📊 RESULTS")
-    print("="*60)
-    print(f"Municipality: {result.municipality}")
-    print(f"Area: {result.total_area_km2:.2f} km²")
-    print(f"Tiles processed: {result.tiles_processed}")
-    print(f"Total parking spaces: {result.total_parking_spaces}")
-    print(f"Empty spaces: {result.empty_spaces}")
-    print(f"Occupied spaces: {result.occupied_spaces}")
-    print(f"Occupancy rate: {result.occupancy_rate:.1%}")
-    print(f"Processing time: {result.processing_time_seconds:.1f} seconds")
-    print(f"GeoJSON: {result.geojson_path}")
+    finally:
+        asyncio.run(orchestrator.close())

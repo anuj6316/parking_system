@@ -108,24 +108,54 @@ class CoordinateConverter:
         self,
         pixel_x: float,
         pixel_y: float,
-        image_bounds_rd: Tuple[float, float, float, float],
-        image_size: Tuple[int, int]
+        image_bounds_rd: Optional[Tuple[float, float, float, float]],
+        image_size: Tuple[int, int],
+        image_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None
     ) -> Tuple[float, float]:
         """
         Convert pixel coordinates to WGS84 lat/lon
         
+        Args:
+            pixel_x: X coordinate in pixels
+            pixel_y: Y coordinate in pixels
+            image_bounds_rd: (west, south, east, north) in RD (Optional)
+            image_size: (width, height) in pixels
+            image_bounds_wgs84: (west, south, east, north) in WGS84 (Optional)
+
         Returns:
             (longitude, latitude)
         """
-        x_rd, y_rd = self.pixel_to_rd(pixel_x, pixel_y, image_bounds_rd, image_size)
-        lon, lat = self.rd_to_wgs84.transform(x_rd, y_rd)
-        return lon, lat
+        # If we have direct WGS84 bounds (e.g., from Google Maps), use them directly
+        if image_bounds_wgs84 is not None:
+            west, south, east, north = image_bounds_wgs84
+            width, height = image_size
+
+            # Interpolate directly
+            x_ratio = pixel_x / width
+            y_ratio = pixel_y / height
+
+            # Longitude increases left to right
+            lon = west + x_ratio * (east - west)
+            # Latitude decreases top to bottom (image coordinates)
+            # Note: image origin is top-left, so y=0 is north, y=height is south
+            lat = north - y_ratio * (north - south)
+
+            return lon, lat
+
+        # Fallback to RD transformation if RD bounds are provided
+        if image_bounds_rd is not None:
+            x_rd, y_rd = self.pixel_to_rd(pixel_x, pixel_y, image_bounds_rd, image_size)
+            lon, lat = self.rd_to_wgs84.transform(x_rd, y_rd)
+            return lon, lat
+
+        raise ValueError("Either image_bounds_rd or image_bounds_wgs84 must be provided")
     
     def corners_to_wgs84(
         self,
         corners_pixels: List[Tuple[float, float]],
-        image_bounds_rd: Tuple[float, float, float, float],
-        image_size: Tuple[int, int]
+        image_bounds_rd: Optional[Tuple[float, float, float, float]],
+        image_size: Tuple[int, int],
+        image_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None
     ) -> List[Tuple[float, float]]:
         """
         Convert list of corner points from pixels to WGS84
@@ -134,13 +164,19 @@ class CoordinateConverter:
             corners_pixels: List of (x, y) pixel coordinates
             image_bounds_rd: Image bounds in RD coordinates
             image_size: Image dimensions in pixels
+            image_bounds_wgs84: Image bounds in WGS84 coordinates
             
         Returns:
             List of (longitude, latitude) tuples
         """
         corners_wgs84 = []
         for px, py in corners_pixels:
-            lon, lat = self.pixel_to_wgs84(px, py, image_bounds_rd, image_size)
+            lon, lat = self.pixel_to_wgs84(
+                px, py,
+                image_bounds_rd,
+                image_size,
+                image_bounds_wgs84
+            )
             corners_wgs84.append((lon, lat))
         return corners_wgs84
     
@@ -352,9 +388,10 @@ class DetectionToGeoConverter:
     def convert_detection(
         self,
         detection: Any,  # Detection object from parking_detector
-        image_bounds_rd: Tuple[float, float, float, float],
+        image_bounds_rd: Optional[Tuple[float, float, float, float]],
         image_size: Tuple[int, int],
-        source_tile: Optional[str] = None
+        source_tile: Optional[str] = None,
+        image_bounds_wgs84: Optional[Tuple[float, float, float, float]] = None
     ) -> Optional[ParkingSpaceGeo]:
         """
         Convert a single detection to geo-referenced parking space
@@ -364,6 +401,7 @@ class DetectionToGeoConverter:
             image_bounds_rd: (west, south, east, north) in Dutch RD
             image_size: (width, height) in pixels
             source_tile: Identifier for source tile
+            image_bounds_wgs84: (west, south, east, north) in WGS84
             
         Returns:
             ParkingSpaceGeo object or None if conversion fails
@@ -385,7 +423,10 @@ class DetectionToGeoConverter:
             
             # Convert to WGS84
             corners_wgs84 = self.coord_converter.corners_to_wgs84(
-                corners_pixels, image_bounds_rd, image_size
+                corners_pixels,
+                image_bounds_rd,
+                image_size,
+                image_bounds_wgs84
             )
             
             # Calculate center
