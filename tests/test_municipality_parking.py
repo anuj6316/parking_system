@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MunicipalityTest")
 
 # Gemini API Key
-GEMINI_API_KEY = "AIzaSyC5ZGOoIeAMgOg0KosdOq10bX4jNIGn_8k"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Default settings
 DEFAULT_MUNICIPALITY = "Amersfoort"

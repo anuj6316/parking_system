@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TestPipeline")
 
 # Gemini API Key
-GEMINI_API_KEY = "AIzaSyC5ZGOoIeAMgOg0KosdOq10bX4jNIGn_8k"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Path to local test images
 TEST_IMAGES_DIR = Path("/home/anu/update2/parking-detection-system/new/images/test")

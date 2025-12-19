@@ -51,7 +51,7 @@ class ProcessingConfig:
     max_concurrent_tiles: int = 8
     
     # Gemini API settings
-    api_key: Optional[str] = "AIzaSyC5ZGOoIeAMgOg0KosdOq10bX4jNIGn_8k"  # Google API key (or set GOOGLE_API_KEY env var)
+    api_key: Optional[str] = None  # Google API key (or set GOOGLE_API_KEY env var)
     model_name: str = "gemini-3-flash-preview"  # Gemini model to use
     
     # Legacy settings (kept for compatibility, ignored by Gemini pipeline)
